@@ -112,19 +112,63 @@ class UTCICalculator:
 
     def calculate_utci(self, points, weather_data, hour_index=12):
         """Calculate UTCI for given points at specified hour."""
-        print(f"Calculating UTCI for hour {hour_index}...")
-        weather = weather_data.iloc[hour_index]
+        import time
+        from datetime import datetime, timedelta
         
-        # Calculate UTCI for each point using the same weather conditions
-        utci_values = np.array([
-            universal_thermal_climate_index(
-                float(weather['air_temp']),
-                float(weather['mean_rad_temp']),
-                float(weather['rel_humidity']),
-                float(weather['wind_speed'])
-            )
-            for _ in points
-        ])
+        print(f"\nCalculating UTCI for hour {hour_index}...")
+        weather = weather_data.iloc[hour_index]
+        total_points = len(points)
+        
+        # Initialize array for results
+        utci_values = np.zeros(total_points)
+        
+        # Process in batches to show progress
+        batch_size = 100000  # Adjust based on your needs
+        num_batches = (total_points + batch_size - 1) // batch_size
+        
+        start_time = time.time()
+        last_update = start_time
+        points_processed = 0
+        
+        print(f"Processing {total_points:,} points...")
+        
+        for batch in range(num_batches):
+            batch_start = batch * batch_size
+            batch_end = min((batch + 1) * batch_size, total_points)
+            
+            # Calculate UTCI for this batch
+            utci_values[batch_start:batch_end] = np.array([
+                universal_thermal_climate_index(
+                    float(weather['air_temp']),
+                    float(weather['mean_rad_temp']),
+                    float(weather['rel_humidity']),
+                    float(weather['wind_speed'])
+                )
+                for _ in range(batch_start, batch_end)
+            ])
+            
+            points_processed = batch_end
+            current_time = time.time()
+            
+            # Update progress every 5 seconds
+            if current_time - last_update >= 5:
+                elapsed_time = current_time - start_time
+                progress = points_processed / total_points
+                estimated_total_time = elapsed_time / progress if progress > 0 else 0
+                remaining_time = estimated_total_time - elapsed_time
+                
+                print(f"Progress: {progress*100:.1f}% ({points_processed:,}/{total_points:,} points)")
+                print(f"Elapsed: {timedelta(seconds=int(elapsed_time))}")
+                print(f"Estimated remaining: {timedelta(seconds=int(remaining_time))}")
+                print(f"Processing speed: {points_processed/elapsed_time:,.0f} points/second")
+                print()
+                
+                last_update = current_time
+        
+        total_time = time.time() - start_time
+        print(f"\nUTCI calculation complete for hour {hour_index}")
+        print(f"Total processing time: {timedelta(seconds=int(total_time))}")
+        print(f"Average processing speed: {total_points/total_time:,.0f} points/second")
         
         return utci_values
 
