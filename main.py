@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import numpy as np
 from ladybug.epw import EPW
-from ladybug_comfort.utci import universal_thermal_climate_index
+from ladybug_comfort.map.utci import universal_thermal_climate_index_np
 import pandas as pd
 import matplotlib.pyplot as plt
 import json
@@ -111,7 +111,7 @@ class UTCICalculator:
             raise
 
     def calculate_utci(self, points, weather_data, hour_index=12):
-        """Calculate UTCI for given points at specified hour."""
+        """Calculate UTCI for given points at specified hour using vectorized NumPy implementation."""
         import time
         from datetime import datetime, timedelta
         
@@ -135,17 +135,17 @@ class UTCICalculator:
         for batch in range(num_batches):
             batch_start = batch * batch_size
             batch_end = min((batch + 1) * batch_size, total_points)
+            current_batch_size = batch_end - batch_start
             
-            # Calculate UTCI for this batch
-            utci_values[batch_start:batch_end] = np.array([
-                universal_thermal_climate_index(
-                    float(weather['air_temp']),
-                    float(weather['mean_rad_temp']),
-                    float(weather['rel_humidity']),
-                    float(weather['wind_speed'])
-                )
-                for _ in range(batch_start, batch_end)
-            ])
+            # Vectorized calculation for entire batch
+            ta = np.full(current_batch_size, weather['air_temp'])
+            tr = np.full(current_batch_size, weather['mean_rad_temp'])
+            vel = np.full(current_batch_size, weather['wind_speed'])
+            rh = np.full(current_batch_size, weather['rel_humidity'])
+            
+            utci_values[batch_start:batch_end] = universal_thermal_climate_index_np(
+                ta, tr, vel, rh
+            )
             
             points_processed = batch_end
             current_time = time.time()
