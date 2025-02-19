@@ -3,10 +3,8 @@ from pathlib import Path
 import numpy as np
 from ladybug.epw import EPW
 from ladybug_comfort.utci import universal_thermal_climate_index
-from pygltflib import GLTF2
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
 import json
 import struct
 
@@ -26,9 +24,8 @@ class UTCICalculator:
 
     def parse_glb(self, filepath):
         """Parse GLB file manually to extract vertex data."""
-        print("Parsing GLB file manually...")
+        print(f"Parsing file as GLB: {filepath}")
         with open(filepath, 'rb') as f:
-            # Read GLB header
             magic = f.read(4)
             if magic != b'glTF':
                 raise ValueError("Not a valid GLB file")
@@ -67,15 +64,13 @@ class UTCICalculator:
                 position_accessor = json_data['accessors'][primitive['attributes']['POSITION']]
                 buffer_view = json_data['bufferViews'][position_accessor['bufferView']]
                 
-                # Extract vertex data from binary chunk
                 start = buffer_view.get('byteOffset', 0)
                 length = buffer_view['byteLength']
-                stride = buffer_view.get('byteStride', 12)  # 3 floats * 4 bytes
+                stride = buffer_view.get('byteStride', 12)
                 
                 vertex_data = bin_data[start:start + length]
                 vertex_count = length // stride
                 
-                # Convert to numpy array
                 vertices_array = np.frombuffer(
                     vertex_data, 
                     dtype=np.float32,
@@ -88,40 +83,28 @@ class UTCICalculator:
 
     def load_model(self):
         """Load and process the 3D model."""
-        print("Loading 3D model...")
         try:
-            # Parse GLB file
             json_data, bin_data = self.parse_glb(self.gltf_path)
-            
-            # Extract vertices
             vertices = self.extract_vertices(json_data, bin_data)
-            
             print(f"Successfully extracted {len(vertices)} vertices")
             return vertices
-            
         except Exception as e:
             print(f"Error in load_model: {str(e)}")
             raise
 
     def load_weather_data(self):
         """Load and process EPW weather data."""
-        print("Loading EPW data...")
-        print(f"Reading from: {self.epw_path}")
-        
-        # Check first few lines of the EPW file
-        with open(self.epw_path, 'r') as f:
-            print("First line of EPW file:")
-            print(f.readline().strip())
-            
         try:
             epw = EPW(str(self.epw_path))
+            
+            # Create hourly data DataFrame
             data = {
-                'air_temp': [h.dry_bulb_temperature for h in epw.dry_bulb_temperature],
-                'rel_humidity': [h.relative_humidity for h in epw.relative_humidity],
-                'wind_speed': [h.wind_speed for h in epw.wind_speed],
-                'mean_rad_temp': [h.dry_bulb_temperature for h in epw.dry_bulb_temperature]
+                'air_temp': epw.dry_bulb_temperature,  # These are now directly float arrays
+                'rel_humidity': epw.relative_humidity,
+                'wind_speed': epw.wind_speed,
+                'mean_rad_temp': epw.dry_bulb_temperature  # Using air temp as MRT for simplification
             }
-            print("Weather data loaded successfully")
+            
             return pd.DataFrame(data)
         except Exception as e:
             print(f"Error loading weather data: {str(e)}")
@@ -132,17 +115,18 @@ class UTCICalculator:
         print(f"Calculating UTCI for hour {hour_index}...")
         weather = weather_data.iloc[hour_index]
         
-        utci_values = []
-        for point in points:
-            utci = universal_thermal_climate_index(
-                weather['air_temp'],
-                weather['mean_rad_temp'],
-                weather['rel_humidity'],
-                weather['wind_speed']
+        # Calculate UTCI for each point using the same weather conditions
+        utci_values = np.array([
+            universal_thermal_climate_index(
+                float(weather['air_temp']),
+                float(weather['mean_rad_temp']),
+                float(weather['rel_humidity']),
+                float(weather['wind_speed'])
             )
-            utci_values.append(utci)
+            for _ in points
+        ])
         
-        return np.array(utci_values)
+        return utci_values
 
     def create_visualization(self, points, utci_values, hour_index):
         """Create visualization of UTCI results."""
@@ -185,7 +169,8 @@ class UTCICalculator:
         
         # Save plot
         plt.tight_layout()
-        plt.savefig(self.output_dir / 'utci_visualization.jpg', dpi=300, bbox_inches='tight')
+        plt.savefig(self.output_dir / f'utci_visualization_hour_{hour_index}.png', 
+                   dpi=300, bbox_inches='tight')
         plt.close()
         
         # Save detailed results
@@ -203,10 +188,10 @@ class UTCICalculator:
             } for point, utci in zip(points, utci_values)]
         }
         
-        with open(self.output_dir / 'utci_results.json', 'w') as f:
+        with open(self.output_dir / f'utci_results_hour_{hour_index}.json', 'w') as f:
             json.dump(results_dict, f, indent=2)
         
-        print("Visualizations saved to output directory")
+        print(f"Results saved to output directory for hour {hour_index}")
 
     def run_analysis(self, hour_index=12):
         """Run complete UTCI analysis."""
@@ -226,15 +211,14 @@ class UTCICalculator:
             print(f"Number of points analyzed: {len(points)}")
             print(f"UTCI Range: {np.min(utci_values):.1f}°C to {np.max(utci_values):.1f}°C")
             print(f"Mean UTCI: {np.mean(utci_values):.1f}°C")
-            print(f"\nResults saved to: {self.output_dir}")
             
             return {
                 'points': points,
                 'utci_values': utci_values,
                 'summary': {
-                    'min_utci': np.min(utci_values),
-                    'max_utci': np.max(utci_values),
-                    'mean_utci': np.mean(utci_values)
+                    'min_utci': float(np.min(utci_values)),
+                    'max_utci': float(np.max(utci_values)),
+                    'mean_utci': float(np.mean(utci_values))
                 }
             }
             
@@ -243,21 +227,24 @@ class UTCICalculator:
             raise
 
 def main():
-    # File paths and debug info
-    print("\nChecking file paths...")
-    
+    # File paths
     current_dir = Path.cwd()
-    gltf_path = current_dir / "data" / "rec_model.gltf"
-    epw_path = current_dir / "data" / "ISR_D_Beer.Sheva.401900_TMYx/ISR_D_Beer.Sheva.401900_TMYx.epw"
+    gltf_path = current_dir / "data" / "rec_model.gltf"  # Using .gltf extension
+    epw_path = current_dir / "data" / "ISR_D_Beer.Sheva.401900_TMYx" / "ISR_D_Beer.Sheva.401900_TMYx.epw"
     output_dir = current_dir / "output"
     
-    print(f"Looking for EPW file at: {epw_path}")
-    print(f"File exists: {epw_path.exists()}")
-    print(f"File size: {epw_path.stat().st_size if epw_path.exists() else 'N/A'} bytes\n")
+    print("\nChecking file paths...")
+    print(f"GLTF file path: {gltf_path}")
+    print(f"EPW file path: {epw_path}")
+    print(f"Output directory: {output_dir}")
     
     # Create calculator and run analysis
     calculator = UTCICalculator(gltf_path, epw_path, output_dir)
-    results = calculator.run_analysis(hour_index=12)  # Analyze for noon
+    
+    # Analyze for multiple hours (e.g., daytime hours)
+    for hour in range(8, 18):  # 8 AM to 5 PM
+        print(f"\nAnalyzing hour {hour}:00")
+        results = calculator.run_analysis(hour_index=hour)
 
 if __name__ == "__main__":
     main()
