@@ -1,3 +1,8 @@
+# run the script with:
+# python utci_calculator.py path/to/model.gltf path/to/weather.epw
+# for me:
+# python utci_calculator.py data/rec_model.gltf data/ISR_D_Beer.Sheva.401900_TMYx/ISR_D_Beer.Sheva.401900_TMYx.epw
+
 import os
 from pathlib import Path
 import numpy as np
@@ -287,8 +292,8 @@ def main():
     # Use argparse for better command-line argument handling
     import argparse
     parser = argparse.ArgumentParser(description="Calculate UTCI from GLTF and EPW files.")
-    parser.add_argument("gltf_path", type=str, help="Path to the GLTF file.")
-    parser.add_argument("epw_path", type=str, help="Path to the EPW file.")
+    parser.add_argument("gltf_path", type=str, help="Path to the GLTF model file")
+    parser.add_argument("epw_path", type=str, help="Path to the EPW weather file")
     parser.add_argument("-o", "--output_dir", type=str, default="output", help="Output directory (default: output).")
     parser.add_argument("-H", "--hour", type=int, default=12, help="Hour of the day for UTCI calculation (0-23, default: 12).")
     args = parser.parse_args()
