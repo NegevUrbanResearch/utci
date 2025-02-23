@@ -1,3 +1,5 @@
+# run the test with:
+# python -m pytest -v --disable-warnings
 # test_utci_calculator.py
 import pytest
 from pathlib import Path
