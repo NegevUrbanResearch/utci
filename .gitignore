@@ -1,3 +1,11 @@
 data/
 output/
 __pycache__
+.coverage
+.pytest_cache
+.vscode
+.DS_Store
+.idea
+.venv
+test_data
+test_main_data
