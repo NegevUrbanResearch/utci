@@ -1,3 +1,5 @@
+# run with:
+# pytest test_utci_calculator.py -v
 import pytest
 from pathlib import Path
 import numpy as np
@@ -18,12 +20,19 @@ def temp_dir():
 
 
 @pytest.fixture
+def sample_epw():
+    """Uses actual EPW file for testing. You can switch to the below fixture to create a sample EPW file for testing."""
+    epw_path = Path(__file__).parent / "data" / "ISR_D_Beer.Sheva.401900_TMYx" / "ISR_D_Beer.Sheva.401900_TMYx.epw"
+    if not epw_path.exists():
+        raise FileNotFoundError(f"EPW file not found at: {epw_path}")
+    return str(epw_path)
+'''
+@pytest.fixture
 def sample_epw(temp_dir):
-    """Create a sample EPW file with proper formatting."""
+    # Create a sample (minimal) EPW file with 8760 lines
     epw_path = os.path.join(temp_dir, "test.epw")
     with open(epw_path, "w") as f:
-        # Write EPW header lines
-        f.write("LOCATION,Unknown Location,,,,,,,0,0,0,0\n")
+        f.write("LOCATION,Unknown Location,,,,,,,0,0,0,0\n") #Added dummy location
         f.write("DESIGN CONDITIONS,0\n")
         f.write("TYPICAL/EXTREME PERIODS,0\n")
         f.write("GROUND TEMPERATURES,0\n")
@@ -31,36 +40,58 @@ def sample_epw(temp_dir):
         f.write("COMMENTS 1\n")
         f.write("COMMENTS 2\n")
         f.write("DATA PERIODS,1,1,Data,Sunday, 1/ 1,12/31\n")
-        
-        # Add 8760 lines of properly formatted data
-        # Format: Year,Month,Day,Hour,Minute,Data Source,Dry Bulb Temp,Dew Point Temp,Rel Humidity,Atm Pressure,
-        #         Extraterrestrial Horizontal Radiation,Extraterrestrial Direct Normal Radiation,
-        #         Horizontal Infrared Radiation Intensity,Global Horizontal Radiation,
-        #         Direct Normal Radiation,Diffuse Horizontal Radiation,Global Horizontal Illuminance,
-        #         Direct Normal Illuminance,Diffuse Horizontal Illuminance,Zenith Luminance,
-        #         Wind Direction,Wind Speed,Total Sky Cover,Opaque Sky Cover,Visibility,
-        #         Ceiling Height,Present Weather Observation,Present Weather Codes,
-        #         Precipitable Water,Aerosol Optical Depth,Snow Depth,Days Since Last Snowfall,
-        #         Albedo,Liquid Precipitation Depth,Liquid Precipitation Quantity
+        # Add 8760 lines of dummy data, setting direct and diffuse radiation
         for i in range(8760):
-            hour = i % 24
-            day = (i // 24) % 31 + 1
-            month = (i // (24 * 31)) % 12 + 1
-            
-            # Set radiation values based on hour
-            if 8 <= hour <= 18:  # Daytime
-                dir_normal_rad = "100"
-                diff_horiz_rad = "20"
-            else:  # Nighttime
-                dir_normal_rad = "0"
-                diff_horiz_rad = "0"
-            
-            # Create a full data line with all 35 required fields
-            data_line = f"2024,{month},{day},{hour},0,9999,10.0,9.0,90.0,101300,0,0,315,0,{dir_normal_rad},{diff_horiz_rad}," + \
-                       f"0,0,0,0,180,1.0,0,0,20000,77777,9,999999999,0,0.0,0,88,0.0,0,0\n"
-            f.write(data_line)
+            if 7 < i%24 < 19: # Simulate daytime hours for testing, avoiding night hours.
+
+                f.write(f"2024,1,1,{i%24 + 1},0,10.0,90.0,0,0,100,20,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n") #Example line for hour with sun.
+            else:
+                f.write(f"2024,1,1,{i%24 + 1},0,10.0,90.0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n")
 
     return epw_path
+
+@pytest.fixture
+def sample_glb(temp_dir):
+    # Correct, minimal GLB content.
+    glb_path = os.path.join(temp_dir, "test.glb")
+    # Create a minimal GLB. This GLB contains a single triangle.
+    gltf_data = {
+      "asset": {"version": "2.0"},
+      "scene": 0,
+      "scenes": [{"nodes": [0]}],
+      "nodes": [{"mesh": 0}],
+      "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "mode": 4}]}],
+      "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max":[1.0, 1.0, 0.0], "min": [-1.0, -1.0, 0.0]}],
+      "bufferViews": [{"buffer": 0, "byteLength": 36, "target": 34962}],
+      "buffers": [{"byteLength": 36}]
+    }
+    binary_data = np.array([
+        [-1.0, -1.0, 0.0],
+        [ 1.0, -1.0, 0.0],
+        [-1.0,  1.0, 0.0],
+    ], dtype=np.float32).tobytes()
+
+    json_string = json.dumps(gltf_data)
+    json_bytes = json_string.encode('utf-8')
+    # Pad JSON chunk with spaces
+    json_padding = b' ' * (4 - (len(json_bytes) % 4)) if len(json_bytes) % 4 != 0 else b''
+    # BIN chunk must be padded with 0x00
+    bin_padding = b'\x00' * (4 - (len(binary_data) % 4)) if len(binary_data) % 4 != 0 else b''
+
+    glb_content = b'glTF'  # Magic number
+    glb_content += struct.pack('<I', 2)  # Version 2
+    glb_content += struct.pack('<I', 28 + len(json_bytes) + len(json_padding) + len(binary_data) + len(bin_padding))  # Total length
+    glb_content += struct.pack('<I', len(json_bytes) + len(json_padding))  # JSON chunk length
+    glb_content += struct.pack('<I', 0x4E4F534A)  # JSON chunk type (JSON)
+    glb_content += json_bytes + json_padding
+    glb_content += struct.pack('<I', len(binary_data) + len(bin_padding)) # BIN chunk length
+    glb_content += struct.pack('<I', 0x004E4942) # BIN chunk type
+    glb_content += binary_data + bin_padding
+
+    with open(glb_path, "wb") as f:
+        f.write(glb_content)
+
+    return glb_path'''
 
 @pytest.fixture
 def sample_glb(temp_dir):
