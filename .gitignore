@@ -9,4 +9,4 @@ __pycache__
 .venv
 test_data
 test_main_data
-utci_results
+radiance_debug
