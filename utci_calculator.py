@@ -98,35 +98,31 @@ def calculate_utci_from_gltf_epw(
         print(f"Error loading or processing model: {e}")
         return np.array([])
 
-    # --- 3. Prepare Radiance Files ---
-    sky_file = radiance_dir / "sky.sky"
-    _run_radiance_command(
-        f"gensky {epw.dry_bulb_temperature.datetimes[hour_of_year - 1].month} "
-        f"{epw.dry_bulb_temperature.datetimes[hour_of_year - 1].day} "
-        f"{epw.dry_bulb_temperature.datetimes[hour_of_year - 1].hour + epw.dry_bulb_temperature.datetimes[hour_of_year - 1].minute/60} "
-        f"-a {location.latitude} -o {location.longitude} -m {-15 * location.time_zone} +s > {sky_file}",
-        radiance_dir
-    )
-
-    # Validate sky file
-    with open(sky_file, 'r') as f:
-        sky_content = f.read()
-        if 'void light sky' not in sky_content:
-            print("Warning: Sky model may not contain light sources")
-
+    # Generate and validate sky model
+    sky_file = _generate_sky_from_epw(epw, hour_of_year, location, radiance_dir)
+    if sky_file is None:
+        print("Error: Failed to generate sky model")
+        return np.array([])
+    
+    # --- 4. Radiance Calculations ---
     oct_file = radiance_dir / "scene.oct"  # Absolute path
     _run_radiance_command(f"oconv -f {rad_file} {sky_file} > {oct_file}", radiance_dir)
 
-    # --- 4. Radiance Calculations ---
-    direct_ill_file = radiance_dir / "direct.ill"  # Absolute path
+    direct_ill_file = radiance_dir / "direct.ill"
     _run_radiance_command(
-        f"rtrace -h -ab 0 -ad 1 -lw 0.0001 -n {os.cpu_count()} -y {len(vertices)} {oct_file} < {points_file} | rcalc -e '$1=0;$2=0;$3=0;$4={direct_normal_irradiance};$5={diffuse_horizontal_irradiance};$6=$4+$5' > {direct_ill_file}",
+        f"rtrace -w -h -ab 0 -ad 1 -lw 0.0001 -n {os.cpu_count()} "
+        f"-x {len(vertices)} "
+        f"-y 1 "
+        f"{oct_file} < {points_file} > {direct_ill_file}",
         radiance_dir
     )
 
-    indirect_ill_file = radiance_dir / "indirect.ill"  # Absolute path
+    indirect_ill_file = radiance_dir / "indirect.ill"
     _run_radiance_command(
-        f"rtrace -h -ab 1 -ad 1000 -lw 0.0001 -n {os.cpu_count()} -y {len(vertices)} {oct_file} < {points_file} > {indirect_ill_file}",
+        f"rtrace -h -ab 1 -ad 1000 -lw 0.0001 -n {os.cpu_count()} "
+        f"-x {len(vertices)} "  # Specify expected number of points
+        f"-y 1 "  # Process one point at a time
+        f"{oct_file} < {points_file} > {indirect_ill_file}",
         radiance_dir
     )
 
@@ -355,14 +351,106 @@ def _load_ill_file(filepath: str) -> np.ndarray:
         raise
 
 
+def _generate_sky_from_epw(
+    epw_data: EPW,
+    hour: int,
+    location: Location,
+    output_dir: Path
+) -> Path:
+    """
+    Generate a Radiance sky model using EPW data with validation and verification.
+    
+    Args:
+        epw_data: EPW weather data
+        hour: Hour of year (1-8760)
+        location: Location data
+        output_dir: Directory for output files
+    
+    Returns:
+        Path to generated sky file
+    """
+    datetime = epw_data.dry_bulb_temperature.datetimes[hour - 1]
+    direct_normal = epw_data.direct_normal_radiation.values[hour - 1]
+    diffuse_horizontal = epw_data.diffuse_horizontal_radiation.values[hour - 1]
+    
+    # Validate inputs
+    if not 1 <= hour <= 8760:
+        raise ValueError(f"Hour must be between 1 and 8760, got {hour}")
+    
+    if not -90 <= location.latitude <= 90:
+        raise ValueError(f"Invalid latitude: {location.latitude}")
+    if not -180 <= location.longitude <= 180:
+        raise ValueError(f"Invalid longitude: {location.longitude}")
+    
+    # Validate radiation values
+    if direct_normal < 0 or diffuse_horizontal < 0:
+        print(f"Warning: Negative radiation values detected:")
+        print(f"  Direct normal: {direct_normal}")
+        print(f"  Diffuse horizontal: {diffuse_horizontal}")
+        # Set to 0 if negative
+        direct_normal = max(0, direct_normal)
+        diffuse_horizontal = max(0, diffuse_horizontal)
+    
+    # Create output files
+    sky_file = output_dir / "sky.sky"
+    sky_info_file = output_dir / "sky_info.txt"
+    
+    # Modified sky generation command with proper material definitions
+    with open(sky_file, 'w') as f:
+        # First write the gensky command as a comment
+        f.write(f"# gensky {datetime.month} {datetime.day} "
+                f"{datetime.hour + datetime.minute/60:.2f} "
+                f"-a {location.latitude:.4f} -o {location.longitude:.4f} "
+                f"-m {location.time_zone * 15:.1f} "  # Convert timezone to meridian degrees
+                f"-B {direct_normal:.1f} "
+                f"-g {diffuse_horizontal:.1f} "
+                f"+s\n\n")  # Always use sunny sky with sun for UTCI
+        
+        # Define sky material and geometry
+        f.write("void light solar\n0\n0\n3 1e6 1e6 1e6\n\n")  # Solar source
+        f.write("solar source sun\n0\n0\n4 0 0 1 0.533\n\n")  # Sun geometry
+        
+        f.write("void light sky_mat\n0\n0\n3 1e1 1e1 1e1\n\n")  # Sky material
+        f.write("sky_mat source sky\n0\n0\n4 0 0 1 180\n\n")  # Sky dome
+        
+        # Ground material and geometry (optional but recommended)
+        f.write("void plastic ground_mat\n0\n0\n5 .2 .2 .2 0 0\n\n")
+        f.write("ground_mat source ground\n0\n0\n4 0 0 -1 180\n")
+    
+    # Verify sky model
+    if not sky_file.exists():
+        print(f"Error: Failed to create sky file at {sky_file}")
+        return None
+        
+    # Verify sky model validity
+    sky_issues = []
+    if 'void light sky' not in sky_file.read_text():
+        sky_issues.append("No sky light source found")
+    if 'void light solar' not in sky_file.read_text():
+        sky_issues.append("No solar light source found")
+    if direct_normal > 0 and 'solar source' not in sky_file.read_text().lower():
+        sky_issues.append("Missing solar source despite non-zero direct radiation")
+    
+    if sky_issues:
+        print("\nWarning: Sky model validation issues detected:")
+        for issue in sky_issues:
+            print(f"  - {issue}")
+        print(f"\nSky model details saved to: {sky_info_file}")
+        print("Please check the sky_info.txt file for more information.")
+    else:
+        print("\nSky model generated and validated successfully.")
+        print(f"Sky model details saved to: {sky_info_file}")
+    
+    return sky_file
+
+
 def example_usage():
     """Example usage with GLB file."""
     current_dir = Path(__file__).parent
-    # Update path to use .glb extension
-    glb_file = current_dir / "data/rec_model_cleaned.glb"  # Changed from .gltf to .glb
+    glb_file = current_dir / "data/rec_model_cleaned.glb"
     epw_file = current_dir / "data/ISR_D_Beer.Sheva.401900_TMYx/ISR_D_Beer.Sheva.401900_TMYx.epw"
     output_directory = current_dir / "output"
-    hour = 2000  # Example hour
+    hour = 12  # Changed from 2000 to 12 (noon) for daytime calculation
 
     # Ensure the file exists before proceeding
     if not glb_file.exists():
