@@ -44,7 +44,7 @@ def sample_epw(temp_dir):
         for i in range(8760):
             if 7 < i%24 < 19: # Simulate daytime hours for testing, avoiding night hours.
 
-                f.write(f"2024,1,1,{i%24 + 1},0,10.0,90.0,0,0,100,20,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n") #Example line for hour with sun.
+                f.write(f"2024,1,1,{i%24 + 1},0,10.0,90.0,0,0,100,20,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n") #Example line for hour with sun.
             else:
                 f.write(f"2024,1,1,{i%24 + 1},0,10.0,90.0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n")
 
@@ -158,6 +158,14 @@ def cleaned_glb(temp_dir):
     shutil.copy(str(original_path), cleaned_glb_path)
     return cleaned_glb_path
 
+@pytest.fixture
+def real_model_glb():
+    """Create a fixture for the real model GLB file."""
+    glb_path = Path(__file__).parent / "data" / "rec_model_no_curve.glb"
+    if not glb_path.exists():
+        raise FileNotFoundError(f"Real model GLB file not found at: {glb_path}")
+    return str(glb_path)
+
 def test_calculate_utci_daytime(cleaned_glb, sample_epw, temp_dir):
     """Test UTCI calculation for a daytime hour with cleaned GLB."""
     hour_of_year = 12  # Changed to noon (hour 12) which is definitely during daytime
@@ -219,3 +227,94 @@ def test_run_radiance_command_failure(temp_dir):
     # Test with a command that will fail
     with pytest.raises(subprocess.CalledProcessError):
         utci_calculator._run_radiance_command("nonexistent_command", Path(temp_dir))
+
+def test_parse_gltf_valid(temp_dir):
+    """Test parsing a GLTF file."""
+    # Create a minimal GLTF file
+    gltf_path = os.path.join(temp_dir, "test.gltf")
+    
+    # Create a minimal GLTF content
+    gltf_data = {
+        "asset": {"version": "2.0"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1, "mode": 4}]}],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": 4, "type": "VEC3", "max":[1.0, 1.0, 0.0], "min": [-1.0, -1.0, 0.0]},
+            {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR", "max": [2], "min": [0]},
+        ],
+        "bufferViews": [
+            {"buffer": 0, "byteLength": 48, "target": 34962},
+            {"buffer": 0, "byteOffset": 48, "byteLength": 6, "target": 34963}
+        ],
+        "buffers": [{"byteLength": 54, "uri": "test.bin"}]
+    }
+    
+    # Create the binary file
+    binary_data = np.array([
+        [-1.0, -1.0, 0.0],
+        [ 1.0, -1.0, 0.0],
+        [-1.0,  1.0, 0.0],
+        [ 1.0,  1.0, 0.0]
+    ], dtype=np.float32).tobytes()
+    
+    indices_data = np.array([0, 1, 2], dtype=np.uint16).tobytes()
+    
+    bin_path = os.path.join(temp_dir, "test.bin")
+    with open(bin_path, "wb") as f:
+        f.write(binary_data + indices_data)
+    
+    with open(gltf_path, "w") as f:
+        json.dump(gltf_data, f)
+    
+    # Test parsing
+    json_data, bin_data = utci_calculator._load_gltf_or_glb(gltf_path)
+    assert isinstance(json_data, dict)
+    assert isinstance(bin_data, bytes)
+    assert "asset" in json_data
+    assert json_data["asset"]["version"] == "2.0"
+
+def test_calculate_utci_with_real_model(real_model_glb, sample_epw, temp_dir):
+    """Test UTCI calculation with the real model GLB file."""
+    hour_of_year = 12  # Noon for daytime calculation
+    utci_values = utci_calculator.calculate_utci_from_gltf_epw(
+        real_model_glb, sample_epw, temp_dir, hour_of_year
+    )
+    assert isinstance(utci_values, np.ndarray)
+    assert len(utci_values) > 0
+    
+    # Print some statistics about the UTCI values for visual inspection
+    print(f"\nUTCI statistics for real model:")
+    print(f"  Count: {len(utci_values):,}")
+    print(f"  Min: {np.min(utci_values):.2f}°C")
+    print(f"  Max: {np.max(utci_values):.2f}°C")
+    print(f"  Mean: {np.mean(utci_values):.2f}°C")
+    print(f"  Median: {np.median(utci_values):.2f}°C")
+
+def test_extract_vertices_from_real_model(real_model_glb):
+    """Test vertex extraction from the real model GLB file."""
+    json_data, bin_data = utci_calculator._load_gltf_or_glb(real_model_glb)
+    assert isinstance(json_data, dict)
+    assert "meshes" in json_data
+    
+    # Verify mesh count
+    assert len(json_data["meshes"]) > 0
+    
+    # Extract and verify vertices
+    vertices = utci_calculator._extract_vertices(json_data, bin_data)
+    assert isinstance(vertices, np.ndarray)
+    assert len(vertices) > 0
+    assert vertices.shape[1] == 3  # Each vertex has x,y,z coordinates
+    
+    # Print vertex statistics for visual inspection
+    print(f"\nVertex statistics for real model:")
+    print(f"  Total vertices: {len(vertices):,}")
+    
+    # Calculate bounding box
+    min_x, min_y, min_z = np.min(vertices, axis=0)
+    max_x, max_y, max_z = np.max(vertices, axis=0)
+    print(f"  Bounding box:")
+    print(f"    X: {min_x:.2f} to {max_x:.2f} (width: {max_x-min_x:.2f})")
+    print(f"    Y: {min_y:.2f} to {max_y:.2f} (depth: {max_y-min_y:.2f})")
+    print(f"    Z: {min_z:.2f} to {max_z:.2f} (height: {max_z-min_z:.2f})")

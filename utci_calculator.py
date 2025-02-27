@@ -22,18 +22,19 @@ def calculate_utci_from_gltf_epw(
     ground_albedo: float = 0.2,
     solar_absorptance: float = 0.7
 ) -> np.ndarray:
-    """Calculates UTCI from a GLB model and EPW file, using Radiance."""
+    """Calculates UTCI from a GLB/GLTF model and EPW file, using Radiance."""
     gltf_path = Path(gltf_path)
     
-    # Simplified validation - only accept .glb files
-    if gltf_path.suffix.lower() != '.glb':
-        raise ValueError(f"File must have .glb extension, got: {gltf_path}")
+    # Modified validation - accept both .glb and .gltf files
+    if gltf_path.suffix.lower() not in ['.glb', '.gltf']:
+        raise ValueError(f"File must have .glb or .gltf extension, got: {gltf_path}")
     
-    # Validate GLB format
-    with open(gltf_path, 'rb') as f:
-        magic = f.read(4)
-        if magic != b'glTF':
-            raise ValueError(f"File {gltf_path} is not a valid GLB file")
+    # Validate GLB format if it's a GLB file
+    if gltf_path.suffix.lower() == '.glb':
+        with open(gltf_path, 'rb') as f:
+            magic = f.read(4)
+            if magic != b'glTF':
+                raise ValueError(f"File {gltf_path} is not a valid GLB file")
     
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)  # Ensure output dir exists
@@ -447,22 +448,32 @@ def _generate_sky_from_epw(
 def example_usage():
     """Example usage with GLB file."""
     current_dir = Path(__file__).parent
-    glb_file = current_dir / "data/rec_model_cleaned.glb"
+    # Use the correct GLB file with .glb extension
+    glb_file = Path("/Users/noamgal/DSProjects/utci/data/rec_model_no_curve.glb")
     epw_file = current_dir / "data/ISR_D_Beer.Sheva.401900_TMYx/ISR_D_Beer.Sheva.401900_TMYx.epw"
     output_directory = current_dir / "output"
-    hour = 12  # Changed from 2000 to 12 (noon) for daytime calculation
-
+    hour = 12  # Noon for daytime calculation
+    
     # Ensure the file exists before proceeding
     if not glb_file.exists():
         print(f"Error: GLB file not found at {glb_file}")
-        print("Please ensure the cleaned model is saved with .glb extension")
+        print("Please check the file path and try again")
         return
-
+    
+    print(f"Processing GLB file: {glb_file}")
+    start_time = time.time()
     utci_values = calculate_utci_from_gltf_epw(str(glb_file), str(epw_file), str(output_directory), hour)
-
+    elapsed_time = time.time() - start_time
+    
     if len(utci_values) > 0:
-        print(f"Calculated UTCI values for {len(utci_values)} points.")
-        print(f"UTCI values (first 10): {utci_values[:10]}")
+        print(f"Calculated UTCI values for {len(utci_values):,} points in {elapsed_time:.2f} seconds.")
+        print(f"UTCI statistics:")
+        print(f"  Min: {np.min(utci_values):.2f}°C")
+        print(f"  Max: {np.max(utci_values):.2f}°C")
+        print(f"  Mean: {np.mean(utci_values):.2f}°C")
+        print(f"  Median: {np.median(utci_values):.2f}°C")
+        
+        # Save the results
         output_file = output_directory / "utci_values.txt"
         output_directory.mkdir(parents=True, exist_ok=True)
         np.savetxt(output_file, utci_values)
