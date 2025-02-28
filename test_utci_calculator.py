@@ -248,13 +248,14 @@ def test_read_rtrace_results(temp_dir):
         f.write("0.5 0.5 0.5\n")  # RGB values
         f.write("0.8 0.8 0.8\n")
         f.write("0.2 0.2 0.2\n")
-    
+
     # Read and verify text format
     results = utci_calculator._read_rtrace_results(text_file)
     assert len(results) == 3
-    assert results[0] == 0.5
-    assert results[1] == 0.8
-    assert results[2] == 0.2
+    assert abs(results[0] - 0.5) < 1e-10  # Use an epsilon for floating-point comparison
+    assert abs(results[1] - 0.8) < 1e-10  # Instead of direct equality
+    assert abs(results[2] - 0.2) < 1e-10
+    
     
     # Create a test binary-like file with simple float data
     binary_file = os.path.join(temp_dir, "binary_results.dat")
