@@ -1,3 +1,4 @@
+# python utci_visualization.py /Users/noamgal/DSProjects/utci/output/utci_results.csv
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
