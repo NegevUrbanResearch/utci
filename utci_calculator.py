@@ -14,6 +14,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor
 from tqdm.auto import tqdm
+import torch
 
 # Honeybee imports
 from honeybee.model import Model
@@ -228,8 +229,31 @@ def gltf_to_honeybee_model(gltf_path, min_area=1e-6, clean_geometry=True):
     return hb_model
 
 
-def _run_radiance_command(command, cwd):
+def check_gpu_availability():
+    """Check if Accelerad GPU capabilities are available."""
+    try:
+        result = subprocess.run(['rtrace_gpu', '-version'], 
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                               text=True, check=False)
+        if "NVIDIA" in result.stdout or "OptiX" in result.stdout:
+            logging.info(f"GPU acceleration available: {result.stdout.strip()}")
+            return True
+        else:
+            logging.warning("GPU acceleration not available or not detected")
+            return False
+    except Exception as e:
+        logging.warning(f"GPU acceleration not available: {e}")
+        return False
+
+def _run_radiance_command(command, cwd, use_gpu=True):
     """Run a Radiance command and capture output."""
+    # Replace rtrace with rtrace_gpu for GPU acceleration if available
+    if use_gpu and check_gpu_availability():
+        if ' rtrace ' in command:
+            command = command.replace(' rtrace ', ' rtrace_gpu ')
+        elif command.startswith('rtrace '):
+            command = command.replace('rtrace ', 'rtrace_gpu ')
+    
     logging.info(f"Running command: {command}")
     
     try:
@@ -289,6 +313,84 @@ def _run_radiance_command(command, cwd):
         logging.error(f"Error output: {e.stderr[:200]}..." if len(e.stderr) > 200 else e.stderr)
         raise
 
+def _run_gpu_rtrace_with_batching(octree_file, sensor_file, results_file, temp_dir, batch_size=5000):
+    """Run rtrace with GPU acceleration using batching to manage GPU memory."""
+    # Count total sensors
+    with open(sensor_file, 'r') as f:
+        total_sensors = sum(1 for _ in f)
+    
+    # Create temporary directory for batched processing
+    batch_dir = os.path.join(temp_dir, "gpu_batches")
+    os.makedirs(batch_dir, exist_ok=True)
+    
+    results = []
+    processed = 0
+    
+    with tqdm(total=total_sensors, desc="GPU ray tracing") as pbar:
+        # Process in batches
+        while processed < total_sensors:
+            # Create batch sensor file
+            batch_file = os.path.join(batch_dir, f"sensors_batch_{processed}.pts")
+            with open(sensor_file, 'r') as f_in:
+                # Skip already processed lines
+                for _ in range(processed):
+                    f_in.readline()
+                    
+                # Write this batch
+                with open(batch_file, 'w') as f_out:
+                    batch_count = 0
+                    for _ in range(batch_size):
+                        line = f_in.readline()
+                        if not line:
+                            break
+                        f_out.write(line)
+                        batch_count += 1
+            
+            if batch_count == 0:
+                break  # No more sensors to process
+            
+            # Run GPU rtrace on this batch
+            batch_results = os.path.join(batch_dir, f"results_batch_{processed}.dat")
+            rtrace_cmd = (
+                f"rtrace_gpu -I -h -ab 1 -ad 1000 -lw 0.0001 "
+                f"-dc 1 -dt 0 -dj 0 -st 0 -ss 0 -faf "
+                f"{octree_file} < {batch_file} > {batch_results}"
+            )
+            
+            try:
+                subprocess.run(rtrace_cmd, shell=True, check=True, cwd=temp_dir)
+                
+                # Read this batch's results
+                with open(batch_results, 'rb') as f_batch:
+                    batch_data = f_batch.read()
+                    results.append(batch_data)
+                
+                # Update progress
+                processed += batch_count
+                pbar.update(batch_count)
+                
+            except subprocess.CalledProcessError as e:
+                logging.error(f"GPU rtrace failed: {e}")
+                logging.warning("Falling back to CPU rtrace")
+                return False
+                
+    # Combine all results
+    with open(results_file, 'wb') as f_out:
+        for result in results:
+            f_out.write(result)
+    
+    return True
+
+def _run_cpu_rtrace(octree_file, sensor_file, results_file, temp_dir):
+    """Run standard rtrace on CPU."""
+    rtrace_cmd = (
+        f"rtrace -I -h -ab 1 -ad 1000 -lw 0.0001 "
+        f"-dc 1 -dt 0 -dj 0 -st 0 -ss 0 -faf "
+        f"{octree_file} < {sensor_file} > {results_file}"
+    )
+    
+    _run_radiance_command(rtrace_cmd, temp_dir, use_gpu=False)
+    return True
 
 def _generate_sky_file(output_dir, location, month, day, hour, direct_normal, diffuse_horizontal):
     """Generate a Radiance sky file."""
@@ -639,7 +741,8 @@ def calculate_utci_from_honeybee_model(
     offset=0.1,
     solar_absorptance=0.7,
     use_centroids=True,
-    max_sensors=10000
+    max_sensors=10000,
+    use_gpu=True
 ):
     """Calculate UTCI using Radiance and the UTCI formula."""
     # Create output directory
@@ -710,16 +813,28 @@ def calculate_utci_from_honeybee_model(
         # Create octree
         octree_file = os.path.join(temp_dir, "scene.oct")
         oconv_cmd = f"oconv {sky_file} {rad_model_file} > {octree_file}"
-        _run_radiance_command(oconv_cmd, temp_dir)
+        _run_radiance_command(oconv_cmd, temp_dir, use_gpu=False)  # oconv doesn't have GPU version
         
-        # Run rtrace for direct solar
+        # Run rtrace for direct solar - try GPU first if enabled
         direct_results_file = os.path.join(temp_dir, "direct_results.dat")
-        rtrace_cmd = (
-            f"rtrace -I -h -ab 1 -ad 1000 -lw 0.0001 "
-            f"-dc 1 -dt 0 -dj 0 -st 0 -ss 0 -faf "
-            f"{octree_file} < {sensor_file} > {direct_results_file}"
-        )
-        _run_radiance_command(rtrace_cmd, temp_dir)
+        
+        # Try GPU with batching if requested and available
+        gpu_success = False
+        if use_gpu and check_gpu_availability():
+            logging.info("Using GPU acceleration for ray tracing...")
+            try:
+                gpu_success = _run_gpu_rtrace_with_batching(
+                    octree_file, sensor_file, direct_results_file, temp_dir
+                )
+            except Exception as e:
+                logging.error(f"GPU ray tracing failed: {e}")
+                logging.warning("Falling back to CPU ray tracing")
+                gpu_success = False
+        
+        # Fall back to CPU if GPU failed or wasn't requested
+        if not gpu_success:
+            logging.info("Using CPU for ray tracing...")
+            _run_cpu_rtrace(octree_file, sensor_file, direct_results_file, temp_dir)
         
         # Read rtrace results
         logging.info("Reading rtrace results...")
@@ -793,6 +908,24 @@ def calculate_utci_from_honeybee_model(
         logging.info(f"UTCI results saved to: {utci_file}")
         logging.info(f"UTCI range: Min {np.min(utci_values):.1f}°C, Max {np.max(utci_values):.1f}°C, Mean {np.mean(utci_values):.1f}°C")
         
+        # Save sensor positions for visualization
+        sensor_positions_file = os.path.join(output_dir, "sensor_positions.csv")
+        with open(sensor_positions_file, "w") as f:
+            f.write("x,y,z\n")
+            # Only save positions for sensors that were used in UTCI calculation
+            for i in range(len(utci_values)):
+                if i >= len(sensor_grid.sensors):
+                    break
+                
+                sensor = sensor_grid.sensors[i]
+                if hasattr(sensor, 'pos') and hasattr(sensor.pos, 'x'):
+                    pos = sensor.pos
+                    f.write(f"{pos.x},{pos.y},{pos.z}\n")
+                elif hasattr(sensor, 'pos') and isinstance(sensor.pos, (list, tuple)):
+                    f.write(f"{sensor.pos[0]},{sensor.pos[1]},{sensor.pos[2]}\n")
+                else:
+                    f.write(f"{sensor['pos'][0]},{sensor['pos'][1]},{sensor['pos'][2]}\n")
+        
         return utci_values
 
 
@@ -806,7 +939,8 @@ def calculate_utci_from_gltf_epw(
     solar_absorptance=0.7,
     clean_geometry=True,
     use_centroids=True,
-    max_sensors=10000
+    max_sensors=10000,
+    use_gpu=True
 ):
     """Calculate UTCI from a GLTF/GLB model using Radiance."""
     # Convert GLTF to Honeybee Model
@@ -822,7 +956,8 @@ def calculate_utci_from_gltf_epw(
         offset=offset,
         solar_absorptance=solar_absorptance,
         use_centroids=use_centroids,
-        max_sensors=max_sensors
+        max_sensors=max_sensors,
+        use_gpu=use_gpu
     )
     
     return utci_values
@@ -839,6 +974,7 @@ if __name__ == "__main__":
     # You can adjust these parameters based on your needs
     grid_size = 1.0  # Larger grid = fewer points = faster calculation
     max_sensors = 10000  # Maximum number of sensor points
+    use_gpu = True  # Enable GPU acceleration if available
     
     # Set logging level
     set_log_level("INFO")
@@ -858,7 +994,8 @@ if __name__ == "__main__":
             solar_absorptance=0.7,
             clean_geometry=True,
             use_centroids=True,
-            max_sensors=max_sensors
+            max_sensors=max_sensors,
+            use_gpu=use_gpu
         )
         
         elapsed_time = time.time() - start_time
