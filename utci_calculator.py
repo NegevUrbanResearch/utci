@@ -726,8 +726,12 @@ def _process_utci_batch(batch_data):
     # Calculate UTCI for each point in the batch
     utci_results = []
     for mrt in mrt_batch:
-        utci = universal_thermal_climate_index(air_temp, mrt, wind_speed, rel_humidity)
-        utci_results.append(utci)
+        # Handle missing or NaN MRT values
+        if np.isnan(mrt):
+            utci_results.append(np.nan)
+        else:
+            utci = universal_thermal_climate_index(air_temp, mrt, wind_speed, rel_humidity)
+            utci_results.append(utci)
         
     return utci_results
 
@@ -742,7 +746,8 @@ def calculate_utci_from_honeybee_model(
     solar_absorptance=0.7,
     use_centroids=True,
     max_sensors=10000,
-    use_gpu=True
+    use_gpu=True,
+    sensor_grid=None  # New optional parameter
 ):
     """Calculate UTCI using Radiance and the UTCI formula."""
     # Create output directory
@@ -794,8 +799,10 @@ def calculate_utci_from_honeybee_model(
     logging.info(f"Weather conditions: Temp {air_temp:.1f}°C, RH {rel_humidity:.1f}%, "
           f"Wind {wind_speed:.1f} m/s, DNI {direct_normal:.1f} W/m², DHI {diffuse_horizontal:.1f} W/m²")
     
-    # Create a sensor grid
-    sensor_grid = create_sensor_grid(hb_model, grid_size, offset, use_centroids, max_sensors)
+    # Create or use existing sensor grid
+    if sensor_grid is None:
+        sensor_grid = create_sensor_grid(hb_model, grid_size, offset, use_centroids, max_sensors)
+    
     num_sensors = len(sensor_grid.sensors)
     logging.info(f"Using sensor grid with {num_sensors} points")
     
@@ -896,6 +903,16 @@ def calculate_utci_from_honeybee_model(
         
         # Convert to numpy array
         utci_values = np.array(utci_values)
+        
+        # Ensure utci_values matches the number of sensors
+        if len(utci_values) != num_sensors:
+            logging.warning(f"Number of UTCI values ({len(utci_values)}) doesn't match sensor count ({num_sensors})")
+            # Truncate or extend as needed
+            if len(utci_values) > num_sensors:
+                utci_values = utci_values[:num_sensors]
+            else:
+                # Extend with NaN values for missing sensors
+                utci_values = np.append(utci_values, np.full(num_sensors - len(utci_values), np.nan))
         
         # Save UTCI values to a file
         utci_file = os.path.join(output_dir, "utci_results.csv")
