@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UTCI Calculator for GLTF/GLB models using Honeybee and Radiance."""
+"""UTCI Calculator for GLTF/GLB models using Honeybee and Radiance with ground-level focus."""
 
 import os
 import time
@@ -609,8 +609,22 @@ def _process_shade(args):
     return result
 
 
-def create_sensor_grid(hb_model, grid_size=0.5, offset=0.1, use_centroids=False, max_sensors=10000):
-    """Create a sensor grid on all shades in the Honeybee Model."""
+def create_sensor_grid(hb_model, grid_size=0.5, offset=0.1, use_centroids=False, max_sensors=10000,
+                      focus_ground_level=False, height_threshold=1.5):
+    """Create a sensor grid on all shades in the Honeybee Model, with optional focus on ground level.
+    
+    Args:
+        hb_model: Honeybee model with shades.
+        grid_size: Size of the grid cells for sensor points.
+        offset: Distance to offset sensor points from surfaces.
+        use_centroids: Use face centroids as fallback when meshing fails.
+        max_sensors: Maximum number of sensor points to generate.
+        focus_ground_level: If True, prioritize ground-level surfaces.
+        height_threshold: Maximum height above minimum z to consider as ground level.
+    
+    Returns:
+        SensorGrid object with sensor points positioned on model surfaces.
+    """
     all_positions = []
     all_directions = []
     
@@ -618,42 +632,87 @@ def create_sensor_grid(hb_model, grid_size=0.5, offset=0.1, use_centroids=False,
     processed_shades = 0
     skipped_shades = 0
     used_centroids = 0
+    ground_level_shades = 0
     
-    # For non-parallel processing, use simple loop
+    # Total shades in the model
     total_shades = len(hb_model.shades)
+    
+    # First pass: identify ground-level shades if focus_ground_level is True
+    ground_level_indices = []
+    if focus_ground_level:
+        # Find the minimum z-coordinate as a reference for "ground level"
+        min_z = float('inf')
+        for shade in hb_model.shades:
+            try:
+                # Check the minimum z of all vertices
+                for vertex in shade.geometry.vertices:
+                    min_z = min(min_z, vertex.z)
+            except Exception:
+                pass
+        
+        # If we couldn't find a valid minimum z, use 0
+        if min_z == float('inf'):
+            min_z = 0
+            
+        logging.info(f"Minimum z-coordinate (ground reference): {min_z:.2f}m")
+        
+        # Find shades that are close to ground level
+        for i, shade in enumerate(hb_model.shades):
+            try:
+                # Check if the shade has any vertices at or near ground level
+                ground_level_points = 0
+                for vertex in shade.geometry.vertices:
+                    if vertex.z <= min_z + height_threshold:
+                        ground_level_points += 1
+                
+                # If at least half the vertices are at ground level, consider it a ground-level shade
+                if ground_level_points >= len(shade.geometry.vertices) / 2:
+                    ground_level_indices.append(i)
+            except Exception:
+                pass
+        
+        ground_level_shades = len(ground_level_indices)
+        logging.info(f"Identified {ground_level_shades} ground-level shades (z ≤ {min_z + height_threshold:.2f}m)")
+        
+        # If we have too few ground-level shades, use all shades
+        if ground_level_shades < 10:  # Arbitrary threshold
+            logging.warning(f"Too few ground-level shades ({ground_level_shades}). Using all shades.")
+            ground_level_indices = list(range(total_shades))
+    else:
+        ground_level_indices = list(range(total_shades))
     
     # Determine if we can use parallel processing
     try:
         # Determine number of processes to use (leave one core free for system)
         num_processes = max(1, multiprocessing.cpu_count() - 1)
-        use_parallel = num_processes > 1 and total_shades > 100  # Only use parallel for larger models
+        use_parallel = num_processes > 1 and len(ground_level_indices) > 100  # Only use parallel for larger models
         
         if use_parallel:
-            logging.info(f"Processing {total_shades} shades using {num_processes} processes...")
+            logging.info(f"Processing {len(ground_level_indices)} shades using {num_processes} processes...")
             
-            # Prepare the arguments for each worker
+            # Prepare the arguments for each worker - only process selected shades
             process_args = [(hb_model.shades[i], i, grid_size, offset, use_centroids) 
-                           for i in range(total_shades)]
+                           for i in ground_level_indices]
             
             # Process in parallel
             with ProcessPoolExecutor(max_workers=num_processes) as executor:
                 results = list(tqdm(
                     executor.map(_process_shade, process_args), 
-                    total=total_shades,
+                    total=len(ground_level_indices),
                     desc="Processing shades"
                 ))
         else:
             # Process sequentially for smaller models or if multiprocessing is unavailable
-            logging.info(f"Processing {total_shades} shades sequentially...")
+            logging.info(f"Processing {len(ground_level_indices)} shades sequentially...")
             results = []
-            for i in tqdm(range(total_shades), desc="Processing shades"):
-                results.append(_process_shade((hb_model.shades[i], i, grid_size, offset, use_centroids)))
+            for idx in tqdm(ground_level_indices, desc="Processing shades"):
+                results.append(_process_shade((hb_model.shades[idx], idx, grid_size, offset, use_centroids)))
     except Exception as e:
         # Fallback to sequential processing if parallel fails
         logging.warning(f"Parallel processing failed: {e}. Switching to sequential processing.")
         results = []
-        for i in tqdm(range(total_shades), desc="Processing shades"):
-            results.append(_process_shade((hb_model.shades[i], i, grid_size, offset, use_centroids)))
+        for idx in tqdm(ground_level_indices, desc="Processing shades"):
+            results.append(_process_shade((hb_model.shades[idx], idx, grid_size, offset, use_centroids)))
     
     # Collect results
     for result in results:
@@ -690,6 +749,14 @@ def create_sensor_grid(hb_model, grid_size=0.5, offset=0.1, use_centroids=False,
     if use_centroids:
         logging.info(f"Used centroids for {used_centroids} shades")
     logging.info(f"Skipped {skipped_shades} shades")
+    
+    # If focusing on ground level, log z-coordinate distribution
+    if focus_ground_level and all_positions:
+        z_values = [p.z if hasattr(p, 'z') else p[2] for p in all_positions]
+        z_min = min(z_values)
+        z_max = max(z_values)
+        z_mean = sum(z_values) / len(z_values)
+        logging.info(f"Z-coordinate distribution: min={z_min:.2f}m, max={z_max:.2f}m, mean={z_mean:.2f}m")
     
     # Create a sensor grid with all positions and directions
     try:
@@ -747,9 +814,30 @@ def calculate_utci_from_honeybee_model(
     use_centroids=True,
     max_sensors=10000,
     use_gpu=True,
-    sensor_grid=None  # New optional parameter
+    sensor_grid=None,  # Optional parameter
+    focus_ground_level=True,  # New parameter
+    height_threshold=1.5  # New parameter
 ):
-    """Calculate UTCI using Radiance and the UTCI formula."""
+    """Calculate UTCI using Radiance and the UTCI formula.
+    
+    Args:
+        hb_model: Honeybee model with shades.
+        epw_path: Path to EPW weather file.
+        output_dir: Directory for output files.
+        hour_of_year: Hour of the year (1-8760) to calculate UTCI for.
+        grid_size: Size of the sensor grid cells in meters.
+        offset: Distance to offset sensors from surfaces in meters.
+        solar_absorptance: Solar absorptance of surfaces (0-1).
+        use_centroids: Use face centroids if meshing fails.
+        max_sensors: Maximum number of sensor points.
+        use_gpu: Use GPU acceleration if available.
+        sensor_grid: Optional pre-created sensor grid.
+        focus_ground_level: Focus on ground-level points for pedestrian comfort.
+        height_threshold: Maximum height above ground level to include points.
+        
+    Returns:
+        Array of UTCI values for each sensor point.
+    """
     # Create output directory
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -801,7 +889,15 @@ def calculate_utci_from_honeybee_model(
     
     # Create or use existing sensor grid
     if sensor_grid is None:
-        sensor_grid = create_sensor_grid(hb_model, grid_size, offset, use_centroids, max_sensors)
+        sensor_grid = create_sensor_grid(
+            hb_model, 
+            grid_size, 
+            offset, 
+            use_centroids, 
+            max_sensors,
+            focus_ground_level=focus_ground_level,
+            height_threshold=height_threshold
+        )
     
     num_sensors = len(sensor_grid.sensors)
     logging.info(f"Using sensor grid with {num_sensors} points")
@@ -925,7 +1021,7 @@ def calculate_utci_from_honeybee_model(
         logging.info(f"UTCI results saved to: {utci_file}")
         logging.info(f"UTCI range: Min {np.min(utci_values):.1f}°C, Max {np.max(utci_values):.1f}°C, Mean {np.mean(utci_values):.1f}°C")
         
-        # Save sensor positions for visualization
+        # Save sensor positions for visualization with ground level information
         sensor_positions_file = os.path.join(output_dir, "sensor_positions.csv")
         with open(sensor_positions_file, "w") as f:
             f.write("x,y,z\n")
@@ -943,6 +1039,25 @@ def calculate_utci_from_honeybee_model(
                 else:
                     f.write(f"{sensor['pos'][0]},{sensor['pos'][1]},{sensor['pos'][2]}\n")
         
+        # Save metadata about this run for visualization
+        metadata_file = os.path.join(output_dir, "utci_metadata.json")
+        metadata = {
+            "focus_ground_level": focus_ground_level,
+            "height_threshold": height_threshold,
+            "num_sensors": num_sensors,
+            "grid_size": grid_size,
+            "hour_of_year": hour_of_year,
+            "weather": {
+                "air_temp": float(air_temp),
+                "rel_humidity": float(rel_humidity),
+                "wind_speed": float(wind_speed),
+                "direct_normal": float(direct_normal),
+                "diffuse_horizontal": float(diffuse_horizontal)
+            }
+        }
+        with open(metadata_file, "w") as f:
+            json.dump(metadata, f, indent=2)
+        
         return utci_values
 
 
@@ -957,9 +1072,30 @@ def calculate_utci_from_gltf_epw(
     clean_geometry=True,
     use_centroids=True,
     max_sensors=10000,
-    use_gpu=True
+    use_gpu=True,
+    focus_ground_level=True,  # New parameter
+    height_threshold=1.5  # New parameter
 ):
-    """Calculate UTCI from a GLTF/GLB model using Radiance."""
+    """Calculate UTCI from a GLTF/GLB model using Radiance.
+    
+    Args:
+        gltf_path: Path to GLTF or GLB file.
+        epw_path: Path to EPW weather file.
+        output_dir: Directory for output files.
+        hour_of_year: Hour of the year (1-8760) to calculate UTCI for.
+        grid_size: Size of the sensor grid cells in meters.
+        offset: Distance to offset sensors from surfaces in meters.
+        solar_absorptance: Solar absorptance of surfaces (0-1).
+        clean_geometry: Clean/validate geometry during conversion.
+        use_centroids: Use face centroids if meshing fails.
+        max_sensors: Maximum number of sensor points.
+        use_gpu: Use GPU acceleration if available.
+        focus_ground_level: Focus on ground-level points for pedestrian comfort.
+        height_threshold: Maximum height above ground level to include points.
+        
+    Returns:
+        Array of UTCI values for each sensor point.
+    """
     # Convert GLTF to Honeybee Model
     hb_model = gltf_to_honeybee_model(gltf_path, min_area=1e-6, clean_geometry=clean_geometry)
     
@@ -974,7 +1110,9 @@ def calculate_utci_from_gltf_epw(
         solar_absorptance=solar_absorptance,
         use_centroids=use_centroids,
         max_sensors=max_sensors,
-        use_gpu=use_gpu
+        use_gpu=use_gpu,
+        focus_ground_level=focus_ground_level,
+        height_threshold=height_threshold
     )
     
     return utci_values
@@ -992,6 +1130,8 @@ if __name__ == "__main__":
     grid_size = 1.0  # Larger grid = fewer points = faster calculation
     max_sensors = 10000  # Maximum number of sensor points
     use_gpu = True  # Enable GPU acceleration if available
+    focus_ground_level = True  # Focus on ground-level points for pedestrian comfort
+    height_threshold = 1.5  # Consider points up to 1.5m above ground level (typical pedestrian height)
     
     # Set logging level
     set_log_level("INFO")
@@ -1012,7 +1152,9 @@ if __name__ == "__main__":
             clean_geometry=True,
             use_centroids=True,
             max_sensors=max_sensors,
-            use_gpu=use_gpu
+            use_gpu=use_gpu,
+            focus_ground_level=focus_ground_level,  # New parameter
+            height_threshold=height_threshold  # New parameter
         )
         
         elapsed_time = time.time() - start_time
@@ -1024,6 +1166,22 @@ if __name__ == "__main__":
         output_file = output_directory / "utci_values.txt"
         np.savetxt(output_file, utci_values)
         logging.info(f"UTCI values saved to: {output_file}")
+        
+        # Generate visualizations automatically if visualization script is available
+        try:
+            from utci_visualization import create_utci_visualization_set
+            sensor_pos_file = output_directory / "sensor_positions.csv"
+            if sensor_pos_file.exists():
+                visualizations = create_utci_visualization_set(
+                    output_directory / "utci_results.csv",
+                    sensor_pos_file,
+                    output_directory,
+                    focus_ground_level=focus_ground_level,
+                    height_threshold=height_threshold
+                )
+                logging.info(f"Generated visualizations: {list(visualizations.keys())}")
+        except ImportError:
+            logging.info("Visualization module not found. Run visualization script separately.")
     
     except Exception as e:
         logging.error(f"Error calculating UTCI: {e}")
