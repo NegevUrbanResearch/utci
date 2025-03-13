@@ -644,14 +644,24 @@ def test_utci_calculator_handles_missing_sensors_gracefully(sample_glb, temp_dir
     # Mock the _read_rtrace_results function to return fewer results than expected
     def mock_read_rtrace_results(results_file):
         return [0.1, 0.2, 0.3]  # Only 3 results
-        
+    
     monkeypatch.setattr("utci_calculator._read_rtrace_results", mock_read_rtrace_results)
     
     # Create a sensor grid with more sensors
     hb_model = utci_calculator.gltf_to_honeybee_model(sample_glb)
+    
+    # Store our sensor grid and make sure it has multiple points
     sensor_grid = utci_calculator.create_sensor_grid(
         hb_model, grid_size=0.5, offset=0.1
     )
+    
+    # Prevent the function from creating a new grid internally
+    original_create_sensor_grid = utci_calculator.create_sensor_grid
+    
+    def mock_create_sensor_grid(*args, **kwargs):
+        return sensor_grid  # Always return our pre-created grid
+    
+    monkeypatch.setattr("utci_calculator.create_sensor_grid", mock_create_sensor_grid)
     
     # Ensure we have more than 3 sensors
     assert len(sensor_grid.sensors) > 3
@@ -675,3 +685,4 @@ def test_utci_calculator_handles_missing_sensors_gracefully(sample_glb, temp_dir
 
 if __name__ == "__main__":
     pytest.main()
+    
